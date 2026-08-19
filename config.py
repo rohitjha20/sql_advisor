@@ -7,6 +7,9 @@ thresholds, and shared utilities for the two-notebook Databricks architecture.
 
 - Notebook 1 (Data Collector):  Imports QUERIES, WATERMARK_CONFIG, STORAGE_CONFIG
 - Notebook 2 (Recommendation Engine):  Imports THRESHOLDS, PRICING, SEVERITY_SCORES, etc.
+
+Categories: INDEXING | STORED_PROCEDURES | VIEWS | SCHEMA | STORAGE |
+            ACTIVITY | ARCHIVAL | PERFORMANCE | COST | OPERATIONS
 """
 
 from dataclasses import dataclass, field
@@ -23,6 +26,12 @@ class Category(Enum):
     STORAGE = "Storage"
     COST = "Cost"
     INDEX = "Index"
+    STORED_PROCEDURES = "Stored Procedures"
+    VIEWS = "Views"
+    SCHEMA = "Schema"
+    ACTIVITY = "Activity"
+    ARCHIVAL = "Archival"
+    OPERATIONS = "Operations"
 
 
 class Severity(Enum):
@@ -35,8 +44,10 @@ class Severity(Enum):
 
 class Effort(Enum):
     QUICK_WIN = "Quick Win"
+    LOW = "Low"
     MODERATE = "Moderate"
     SIGNIFICANT = "Significant"
+    HIGH = "High"
 
 
 class Risk(Enum):
@@ -119,22 +130,68 @@ class AdvisorConfig:
     fragmentation_reorg_pct: float = 10.0
     min_index_pages: int = 1000
     duplicate_index_check: bool = True
+    top_missing_indexes: int = 30
+    high_index_count_per_table: int = 10
+    write_heavy_index_min_updates: int = 10000
+    fk_missing_index_min_rows: int = 10000
 
     # ── Storage Thresholds ──
     compression_savings_min_pct: float = 20.0
     table_size_concern_gb: float = 10.0
     nvarchar_audit_enabled: bool = True
     max_column_oversized_ratio: float = 5.0
+    high_index_to_data_ratio: float = 3.0
+    unused_space_min_mb: float = 100.0
+    unused_space_pct_threshold: float = 30.0
+    top_tables_count: int = 50
+
+    # ── Stored Procedure Thresholds ──
+    sp_top_count: int = 50
+    sp_min_execution_count: int = 10
+    sp_high_cpu_ms: float = 5000.0
+    sp_high_reads: int = 100000
+    sp_high_duration_ms: float = 10000.0
+    sp_recompile_threshold: int = 10
+    sp_high_writes: int = 50000
+
+    # ── Views Thresholds ──
+    view_nested_threshold: int = 2
+    view_complex_length: int = 8000
+    indexed_view_reads_threshold: int = 1000
+    indexed_view_write_ratio: int = 5
+
+    # ── Schema Thresholds ──
+    wide_table_column_threshold: int = 30
+    nvarchar_column_alert_count: int = 5
+
+    # ── Archival Thresholds ──
+    archival_min_size_mb: float = 100.0
+    partition_candidate_min_gb: float = 5.0
+    cold_table_critical_days: int = 730
+    cold_table_high_days: int = 365
+    cold_table_medium_days: int = 180
+
+    # ── Operations Thresholds ──
+    stale_stats_days: int = 14
+    plan_cache_single_use_pct: float = 70.0
+    long_transaction_threshold_seconds: int = 300
 
     # ── Cost Thresholds ──
     underutilized_cpu_pct: float = 25.0
     underutilized_io_pct: float = 25.0
     idle_period_threshold_hours: float = 1.0
 
-    # ── Priority Weights (must sum to 1.0) ──
-    weight_performance: float = 0.40
-    weight_storage: float = 0.30
-    weight_cost: float = 0.30
+    # ── Priority Weights (10 categories) ──
+    weight_performance: float = 0.20
+    weight_indexing: float = 0.15
+    weight_stored_procedures: float = 0.15
+    weight_storage: float = 0.10
+    weight_cost: float = 0.10
+    weight_views: float = 0.05
+    weight_schema: float = 0.05
+    weight_activity: float = 0.05
+    weight_archival: float = 0.05
+    weight_operations: float = 0.10
 
     # ── Output ──
     output_dir: str = "./reports"
@@ -142,8 +199,13 @@ class AdvisorConfig:
     recommendations_base_path: str = "recommendations"
 
     def __post_init__(self):
-        total_weight = self.weight_performance + self.weight_storage + self.weight_cost
-        if not math.isclose(total_weight, 1.0, abs_tol=0.001):
+        total_weight = (
+            self.weight_performance + self.weight_indexing +
+            self.weight_stored_procedures + self.weight_storage +
+            self.weight_cost + self.weight_views + self.weight_schema +
+            self.weight_activity + self.weight_archival + self.weight_operations
+        )
+        if not math.isclose(total_weight, 1.0, abs_tol=0.01):
             raise ValueError(f"Priority weights must sum to 1.0, but got {total_weight}")
 
 
@@ -158,6 +220,52 @@ SEVERITY_SCORES = {
     Severity.LOW: 25,
     Severity.INFO: 10,
 }
+
+# String-keyed version for Spark map lookups
+SEVERITY_SCORES_STR = {
+    "CRITICAL": 100,
+    "HIGH": 75,
+    "MEDIUM": 50,
+    "LOW": 25,
+    "INFO": 10,
+}
+
+# Maps category string → config weight field name
+CATEGORY_WEIGHT_FIELDS = {
+    "PERFORMANCE": "weight_performance",
+    "INDEXING": "weight_indexing",
+    "STORED_PROCEDURES": "weight_stored_procedures",
+    "STORAGE": "weight_storage",
+    "COST": "weight_cost",
+    "VIEWS": "weight_views",
+    "SCHEMA": "weight_schema",
+    "ACTIVITY": "weight_activity",
+    "ARCHIVAL": "weight_archival",
+    "OPERATIONS": "weight_operations",
+}
+
+# All analysis categories (used for output & summaries)
+ANALYSIS_CATEGORIES = [
+    "INDEXING",
+    "STORED_PROCEDURES",
+    "VIEWS",
+    "SCHEMA",
+    "STORAGE",
+    "ACTIVITY",
+    "ARCHIVAL",
+    "PERFORMANCE",
+    "COST",
+    "OPERATIONS",
+]
+
+# Output columns for recommendation rows
+OUTPUT_COLUMNS = [
+    "category", "subcategory", "severity", "object_type",
+    "schema_name", "object_name", "recommendation", "recommendation_detail",
+    "action_sql", "estimated_impact_pct", "estimated_savings_mb",
+    "estimated_cost_monthly", "effort", "risk", "confidence",
+    "source_dmv", "metric_value", "metric_threshold",
+]
 
 
 # =============================================================================
@@ -194,16 +302,85 @@ AZURE_SQL_PRICING = {
     'BC_Gen5_4':   {'name': 'BC Gen5 4vCores',          'price': 1917.94},
 }
 
+# Tier ordering for scale-up/down recommendations
+DTU_TIER_ORDER = ['B', 'S0', 'S1', 'S2', 'S3', 'S4', 'S6', 'S7', 'S9', 'S12',
+                  'P1', 'P2', 'P4', 'P6', 'P11', 'P15']
+VCORE_GP_TIER_ORDER = ['GP_Gen5_2', 'GP_Gen5_4', 'GP_Gen5_8', 'GP_Gen5_16', 'GP_Gen5_32']
+VCORE_BC_TIER_ORDER = ['BC_Gen5_2', 'BC_Gen5_4']
+VCORE_SERVERLESS_ORDER = ['GP_S_Gen5_2', 'GP_S_Gen5_4']
+
 
 # =============================================================================
-# 5. SQL QUERIES CATALOG
+# 5. STORED PROCEDURE BEST PRACTICES
+# =============================================================================
+
+SP_BEST_PRACTICES = {
+    "missing_nocount": {
+        "pattern": "SET NOCOUNT ON",
+        "check": "NOT LIKE",
+        "severity": "LOW",
+        "recommendation": "Add SET NOCOUNT ON",
+        "detail": "Reduces unnecessary TDS_DONE network packets, improving throughput.",
+    },
+    "select_star": {
+        "pattern": "SELECT *",
+        "check": "LIKE",
+        "severity": "LOW",
+        "recommendation": "Avoid SELECT * — explicitly list columns",
+        "detail": "Retrieving all columns increases IO and memory usage; explicit columns improve plan quality.",
+    },
+    "cursor_usage": {
+        "pattern": "CURSOR",
+        "check": "LIKE",
+        "severity": "MEDIUM",
+        "recommendation": "Replace CURSOR with set-based logic",
+        "detail": "Row-by-row cursor processing is orders of magnitude slower than set-based operations.",
+    },
+    "dynamic_exec": {
+        "pattern": "EXEC(",
+        "check": "LIKE",
+        "severity": "MEDIUM",
+        "recommendation": "Use sp_executesql instead of EXEC()",
+        "detail": "sp_executesql allows parameterized execution — prevents SQL injection and enables plan reuse.",
+    },
+    "table_variable": {
+        "pattern": "DECLARE%@%TABLE",
+        "check": "LIKE",
+        "severity": "MEDIUM",
+        "recommendation": "Review table variable usage for large rowsets",
+        "detail": "Table variables produce 1-row cardinality estimates. Use #temp tables for medium/large intermediate results.",
+    },
+    "option_recompile": {
+        "pattern": "OPTION (RECOMPILE)",
+        "check": "LIKE",
+        "severity": "LOW",
+        "recommendation": "Validate OPTION(RECOMPILE) cost/benefit",
+        "detail": "Fixes parameter-sensitive plans but increases compile CPU. Keep only where runtime savings exceed overhead.",
+    },
+    "transaction_without_try": {
+        "pattern": "BEGIN TRAN",
+        "check": "LIKE_WITHOUT",
+        "anti_pattern": "TRY",
+        "severity": "MEDIUM",
+        "recommendation": "Wrap explicit transactions in TRY/CATCH",
+        "detail": "Unguarded transactions can remain open after errors, causing blocking and log growth.",
+    },
+}
+
+# Compression estimate factors
+COMPRESSION_ESTIMATES = {
+    "PAGE": 0.40,   # ~40% space savings
+    "ROW": 0.15,    # ~15% space savings
+}
+
+
+# =============================================================================
+# 6. SQL QUERIES CATALOG
 #    Used by Notebook 1 (Data Collector).
 #    Keys match the metric names used in storage paths & watermarks.
 # =============================================================================
 
 # Queries that support incremental (time-filtered) extraction.
-# Each returns a tuple of (base_sql, watermark_column_name) so the notebook
-# can inject the WHERE clause dynamically.
 INCREMENTAL_QUERIES = {
     'resource_stats': {
         'sql': """
@@ -252,6 +429,8 @@ SNAPSHOT_QUERIES = {
             GETUTCDATE() AS analysis_time,
             (SELECT COUNT(*) FROM sys.tables) AS table_count,
             (SELECT COUNT(*) FROM sys.indexes WHERE type > 0) AS index_count,
+            (SELECT COUNT(*) FROM sys.procedures WHERE is_ms_shipped = 0) AS procedure_count,
+            (SELECT COUNT(*) FROM sys.views WHERE is_ms_shipped = 0) AS view_count,
             (SELECT SUM(reserved_page_count) * 8 / 1024.0 FROM sys.dm_db_partition_stats) AS total_size_mb
     """,
     'top_queries_cpu': """
@@ -424,6 +603,71 @@ SNAPSHOT_QUERIES = {
             AND ips.avg_fragmentation_in_percent > {fragmentation_reorg_pct}
         ORDER BY ips.avg_fragmentation_in_percent DESC
     """,
+    'index_usage_patterns': """
+        SELECT
+            OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,
+            OBJECT_NAME(i.object_id) AS table_name,
+            i.name AS index_name,
+            i.type_desc,
+            ISNULL(s.user_seeks, 0) AS user_seeks,
+            ISNULL(s.user_scans, 0) AS user_scans,
+            ISNULL(s.user_lookups, 0) AS user_lookups,
+            ISNULL(s.user_updates, 0) AS user_updates,
+            CASE WHEN ISNULL(s.user_seeks,0)+ISNULL(s.user_scans,0) > ISNULL(s.user_updates,0) THEN 'READ_HEAVY'
+                 WHEN ISNULL(s.user_updates,0) > ISNULL(s.user_seeks,0)+ISNULL(s.user_scans,0) THEN 'WRITE_HEAVY'
+                 ELSE 'BALANCED' END AS usage_pattern
+        FROM sys.indexes i
+        LEFT JOIN sys.dm_db_index_usage_stats s ON i.object_id=s.object_id AND i.index_id=s.index_id AND s.database_id=DB_ID()
+        WHERE OBJECTPROPERTY(i.object_id,'IsUserTable')=1 AND i.type>0 AND i.name IS NOT NULL
+    """,
+    'fk_without_index': """
+        WITH FKColumnCounts AS (
+            SELECT constraint_object_id, COUNT(*) AS fk_column_count
+            FROM sys.foreign_key_columns GROUP BY constraint_object_id
+        ),
+        SingleColumnFK AS (
+            SELECT fk.name AS fk_name, fk.parent_object_id,
+                OBJECT_SCHEMA_NAME(fk.parent_object_id) AS schema_name,
+                OBJECT_NAME(fk.parent_object_id) AS table_name,
+                pc.name AS column_name,
+                SUM(ps.row_count) AS row_count
+            FROM sys.foreign_keys fk
+            JOIN sys.foreign_key_columns fkc ON fk.object_id=fkc.constraint_object_id
+            JOIN FKColumnCounts fkcc ON fk.object_id=fkcc.constraint_object_id AND fkcc.fk_column_count=1
+            JOIN sys.columns pc ON fkc.parent_object_id=pc.object_id AND fkc.parent_column_id=pc.column_id
+            JOIN sys.dm_db_partition_stats ps ON fk.parent_object_id=ps.object_id AND ps.index_id IN(0,1)
+            WHERE fk.is_disabled=0 AND fk.is_not_trusted=0
+            GROUP BY fk.name, fk.parent_object_id, pc.name
+            HAVING SUM(ps.row_count) >= {fk_missing_index_min_rows}
+        )
+        SELECT fk.* FROM SingleColumnFK fk
+        WHERE NOT EXISTS (
+            SELECT 1 FROM sys.indexes i
+            JOIN sys.index_columns ic ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+            JOIN sys.columns c ON ic.object_id=c.object_id AND ic.column_id=c.column_id
+            WHERE i.object_id=fk.parent_object_id AND i.is_disabled=0 AND i.type>0
+                AND ic.is_included_column=0 AND ic.key_ordinal=1 AND c.name=fk.column_name
+        )
+        ORDER BY fk.row_count DESC
+    """,
+    'columnstore_candidates': """
+        SELECT TOP 20
+            OBJECT_SCHEMA_NAME(p.object_id) AS schema_name,
+            OBJECT_NAME(p.object_id) AS table_name,
+            SUM(p.row_count) AS row_count,
+            SUM(p.reserved_page_count)*8/1024.0 AS size_mb,
+            ISNULL(MAX(s.user_scans),0) AS scan_count,
+            ISNULL(MAX(s.user_seeks),0) AS seek_count,
+            ISNULL(MAX(s.user_updates),0) AS update_count
+        FROM sys.dm_db_partition_stats p
+        JOIN sys.objects o ON p.object_id=o.object_id
+        LEFT JOIN sys.dm_db_index_usage_stats s ON p.object_id=s.object_id AND p.index_id=s.index_id AND s.database_id=DB_ID()
+        LEFT JOIN sys.indexes ci ON p.object_id=ci.object_id AND ci.type=5
+        WHERE o.type='U' AND ci.object_id IS NULL
+        GROUP BY p.object_id
+        HAVING SUM(p.row_count)>1000000 AND SUM(p.reserved_page_count)*8/1024.0>500
+        ORDER BY size_mb DESC
+    """,
     'table_sizes': """
         SELECT TOP 50
             OBJECT_SCHEMA_NAME(p.object_id) AS schema_name,
@@ -490,6 +734,308 @@ SNAPSHOT_QUERIES = {
             AND TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
         ORDER BY TABLE_NAME, ORDINAL_POSITION
     """,
+
+    # ── NEW: Stored Procedure metrics ──
+    'sp_execution_stats': """
+        SELECT TOP {sp_top_count}
+            OBJECT_SCHEMA_NAME(ps.object_id) AS schema_name,
+            OBJECT_NAME(ps.object_id) AS procedure_name,
+            ps.execution_count,
+            ps.total_worker_time / 1000 AS total_cpu_ms,
+            ps.total_worker_time / NULLIF(ps.execution_count,0) / 1000 AS avg_cpu_ms,
+            ps.total_elapsed_time / NULLIF(ps.execution_count,0) / 1000 AS avg_duration_ms,
+            ps.total_logical_reads / NULLIF(ps.execution_count,0) AS avg_logical_reads,
+            ps.total_logical_writes / NULLIF(ps.execution_count,0) AS avg_logical_writes,
+            ps.total_physical_reads / NULLIF(ps.execution_count,0) AS avg_physical_reads,
+            ps.plan_generation_num AS recompile_count,
+            ps.last_execution_time, ps.cached_time
+        FROM sys.dm_exec_procedure_stats ps
+        WHERE ps.database_id = DB_ID() AND ps.execution_count >= {sp_min_execution_count}
+        ORDER BY avg_cpu_ms DESC
+    """,
+    'sp_source_code': """
+        SELECT
+            OBJECT_SCHEMA_NAME(p.object_id) AS schema_name,
+            p.name AS procedure_name,
+            LEN(m.definition) AS definition_length,
+            CASE WHEN m.definition NOT LIKE '%SET NOCOUNT ON%' THEN 1 ELSE 0 END AS missing_nocount,
+            CASE WHEN m.definition LIKE '%SELECT *%' THEN 1 ELSE 0 END AS has_select_star,
+            CASE WHEN m.definition LIKE '%CURSOR%' THEN 1 ELSE 0 END AS uses_cursor,
+            CASE WHEN m.definition LIKE '%EXEC(%' OR m.definition LIKE '%EXECUTE(%' THEN 1 ELSE 0 END AS uses_dynamic_exec,
+            CASE WHEN m.definition LIKE '%DECLARE%@%' AND m.definition LIKE '%TABLE%' THEN 1 ELSE 0 END AS uses_table_variable,
+            CASE WHEN m.definition LIKE '%OPTION (RECOMPILE)%' OR m.definition LIKE '%OPTION(RECOMPILE)%' THEN 1 ELSE 0 END AS uses_option_recompile,
+            CASE WHEN m.definition LIKE '%BEGIN TRAN%' AND m.definition NOT LIKE '%TRY%' THEN 1 ELSE 0 END AS transaction_without_try
+        FROM sys.procedures p
+        JOIN sys.sql_modules m ON p.object_id = m.object_id
+        WHERE p.is_ms_shipped = 0
+    """,
+    'sp_parameter_sniffing': """
+        SELECT TOP {sp_top_count}
+            OBJECT_SCHEMA_NAME(ps.object_id) AS schema_name,
+            OBJECT_NAME(ps.object_id) AS procedure_name,
+            ps.execution_count,
+            ps.min_worker_time/1000 AS min_cpu_ms,
+            ps.max_worker_time/1000 AS max_cpu_ms,
+            ps.total_worker_time/NULLIF(ps.execution_count,0)/1000 AS avg_cpu_ms,
+            CASE WHEN ps.max_worker_time/NULLIF(ps.min_worker_time,0) > 10 THEN 'SEVERE'
+                 WHEN ps.max_worker_time/NULLIF(ps.min_worker_time,0) > 5  THEN 'MODERATE'
+                 ELSE 'LOW' END AS sniffing_risk,
+            ps.min_elapsed_time/1000 AS min_duration_ms,
+            ps.max_elapsed_time/1000 AS max_duration_ms
+        FROM sys.dm_exec_procedure_stats ps
+        WHERE ps.database_id = DB_ID()
+            AND ps.execution_count >= {sp_min_execution_count}
+            AND ps.max_worker_time / NULLIF(ps.min_worker_time,0) > 5
+        ORDER BY ps.max_worker_time / NULLIF(ps.min_worker_time,0) DESC
+    """,
+
+    # ── NEW: Views metrics ──
+    'views_analysis': """
+        SELECT
+            OBJECT_SCHEMA_NAME(v.object_id) AS schema_name,
+            v.name AS view_name,
+            OBJECTPROPERTY(v.object_id, 'IsSchemaBound') AS is_schema_bound,
+            OBJECTPROPERTY(v.object_id, 'IsIndexed') AS is_indexed,
+            LEN(m.definition) AS definition_length,
+            v.create_date, v.modify_date,
+            CASE WHEN m.definition LIKE '%SELECT *%' THEN 1 ELSE 0 END AS has_select_star,
+            CASE WHEN m.definition LIKE '%NOLOCK%' THEN 1 ELSE 0 END AS uses_nolock,
+            CASE WHEN OBJECTPROPERTY(v.object_id, 'IsSchemaBound') = 0 THEN 1 ELSE 0 END AS missing_schemabinding,
+            (SELECT COUNT(*) FROM sys.sql_expression_dependencies d
+             WHERE d.referencing_id = v.object_id
+             AND OBJECTPROPERTY(OBJECT_ID(ISNULL(d.referenced_schema_name,'dbo')+'.'+d.referenced_entity_name), 'IsView') = 1) AS nested_view_count
+        FROM sys.views v
+        LEFT JOIN sys.sql_modules m ON v.object_id = m.object_id
+        WHERE v.is_ms_shipped = 0
+    """,
+    'indexed_view_candidates': """
+        SELECT
+            OBJECT_SCHEMA_NAME(v.object_id) AS schema_name,
+            v.name AS view_name,
+            ISNULL(s.user_seeks,0)+ISNULL(s.user_scans,0) AS total_reads,
+            ISNULL(s.user_updates,0) AS total_writes
+        FROM sys.views v
+        LEFT JOIN sys.dm_db_index_usage_stats s ON v.object_id=s.object_id AND s.index_id<=1 AND s.database_id=DB_ID()
+        WHERE v.is_ms_shipped=0 AND OBJECTPROPERTY(v.object_id,'IsIndexed')=0 AND OBJECTPROPERTY(v.object_id,'IsSchemaBound')=1
+        ORDER BY total_reads DESC
+    """,
+    'indexed_view_usage': """
+        SELECT
+            OBJECT_SCHEMA_NAME(v.object_id) AS schema_name,
+            v.name AS view_name,
+            SUM(ISNULL(s.user_seeks,0)+ISNULL(s.user_scans,0)+ISNULL(s.user_lookups,0)) AS total_reads,
+            SUM(ISNULL(s.user_updates,0)) AS total_writes,
+            COUNT(i.index_id) AS indexed_view_index_count
+        FROM sys.views v
+        JOIN sys.indexes i ON v.object_id=i.object_id AND i.index_id>0
+        LEFT JOIN sys.dm_db_index_usage_stats s ON i.object_id=s.object_id AND i.index_id=s.index_id AND s.database_id=DB_ID()
+        WHERE v.is_ms_shipped=0 AND OBJECTPROPERTY(v.object_id,'IsIndexed')=1
+        GROUP BY v.object_id, v.name
+        ORDER BY total_writes DESC
+    """,
+
+    # ── NEW: Schema metrics ──
+    'heap_tables': """
+        SELECT OBJECT_SCHEMA_NAME(t.object_id) AS schema_name, t.name AS table_name,
+            SUM(ps.row_count) AS row_count, SUM(ps.reserved_page_count)*8/1024.0 AS size_mb
+        FROM sys.tables t
+        JOIN sys.dm_db_partition_stats ps ON t.object_id=ps.object_id AND ps.index_id=0
+        WHERE t.is_ms_shipped=0 GROUP BY t.object_id, t.name
+    """,
+    'tables_no_pk': """
+        SELECT SCHEMA_NAME(t.schema_id) AS schema_name, t.name AS table_name,
+            SUM(ps.row_count) AS row_count
+        FROM sys.tables t
+        LEFT JOIN sys.key_constraints kc ON t.object_id=kc.parent_object_id AND kc.type='PK'
+        JOIN sys.dm_db_partition_stats ps ON t.object_id=ps.object_id AND ps.index_id IN(0,1)
+        WHERE kc.object_id IS NULL AND t.is_ms_shipped=0
+        GROUP BY t.schema_id, t.name
+    """,
+    'wide_tables': """
+        SELECT TABLE_SCHEMA AS schema_name, TABLE_NAME AS table_name, COUNT(*) AS column_count
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA NOT IN ('sys','INFORMATION_SCHEMA')
+        GROUP BY TABLE_SCHEMA, TABLE_NAME
+        HAVING COUNT(*) > {wide_table_column_threshold}
+        ORDER BY column_count DESC
+    """,
+    'lob_columns': """
+        SELECT c.TABLE_SCHEMA AS schema_name, c.TABLE_NAME AS table_name,
+            COUNT(*) AS lob_column_count,
+            STRING_AGG(c.COLUMN_NAME+' '+c.DATA_TYPE, ', ') WITHIN GROUP (ORDER BY c.ORDINAL_POSITION) AS lob_columns
+        FROM INFORMATION_SCHEMA.COLUMNS c
+        WHERE c.TABLE_SCHEMA NOT IN ('sys','INFORMATION_SCHEMA')
+            AND (c.DATA_TYPE IN ('text','ntext','image','xml') OR c.CHARACTER_MAXIMUM_LENGTH=-1)
+        GROUP BY c.TABLE_SCHEMA, c.TABLE_NAME
+        HAVING COUNT(*) > 0
+        ORDER BY lob_column_count DESC
+    """,
+
+    # ── NEW: Activity metrics ──
+    'current_activity': """
+        SELECT s.login_name, s.host_name, s.program_name, s.status,
+            s.cpu_time AS session_cpu_time, s.memory_usage*8 AS memory_kb,
+            s.reads AS session_reads, s.writes AS session_writes,
+            s.total_elapsed_time/1000 AS session_duration_ms,
+            r.command, r.status AS request_status
+        FROM sys.dm_exec_sessions s
+        LEFT JOIN sys.dm_exec_requests r ON s.session_id=r.session_id
+        WHERE s.is_user_process=1
+    """,
+    'operation_types': """
+        SELECT
+            CASE WHEN UPPER(LTRIM(st.text)) LIKE 'SELECT%' THEN 'SELECT'
+                 WHEN UPPER(LTRIM(st.text)) LIKE 'INSERT%' THEN 'INSERT'
+                 WHEN UPPER(LTRIM(st.text)) LIKE 'UPDATE%' THEN 'UPDATE'
+                 WHEN UPPER(LTRIM(st.text)) LIKE 'DELETE%' THEN 'DELETE'
+                 WHEN UPPER(LTRIM(st.text)) LIKE 'EXEC%'   THEN 'EXEC_SP'
+                 WHEN UPPER(LTRIM(st.text)) LIKE 'CREATE%' OR UPPER(LTRIM(st.text)) LIKE 'ALTER%' OR UPPER(LTRIM(st.text)) LIKE 'DROP%' THEN 'DDL'
+                 ELSE 'OTHER' END AS operation_type,
+            COUNT(*) AS query_count,
+            SUM(qs.execution_count) AS total_executions,
+            SUM(qs.total_worker_time)/1000 AS total_cpu_ms,
+            SUM(qs.total_logical_reads) AS total_reads,
+            SUM(qs.total_logical_writes) AS total_writes
+        FROM sys.dm_exec_query_stats qs
+        CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+        GROUP BY CASE WHEN UPPER(LTRIM(st.text)) LIKE 'SELECT%' THEN 'SELECT'
+                      WHEN UPPER(LTRIM(st.text)) LIKE 'INSERT%' THEN 'INSERT'
+                      WHEN UPPER(LTRIM(st.text)) LIKE 'UPDATE%' THEN 'UPDATE'
+                      WHEN UPPER(LTRIM(st.text)) LIKE 'DELETE%' THEN 'DELETE'
+                      WHEN UPPER(LTRIM(st.text)) LIKE 'EXEC%'   THEN 'EXEC_SP'
+                      WHEN UPPER(LTRIM(st.text)) LIKE 'CREATE%' OR UPPER(LTRIM(st.text)) LIKE 'ALTER%' OR UPPER(LTRIM(st.text)) LIKE 'DROP%' THEN 'DDL'
+                      ELSE 'OTHER' END
+        ORDER BY total_cpu_ms DESC
+    """,
+    'connection_patterns': """
+        SELECT s.program_name, s.host_name, COUNT(*) AS connection_count,
+            SUM(CASE WHEN s.status='sleeping' THEN 1 ELSE 0 END) AS idle_connections,
+            SUM(CASE WHEN s.status='running' THEN 1 ELSE 0 END) AS active_connections,
+            AVG(s.cpu_time) AS avg_cpu_time, AVG(s.memory_usage)*8 AS avg_memory_kb
+        FROM sys.dm_exec_sessions s
+        WHERE s.is_user_process=1
+        GROUP BY s.program_name, s.host_name ORDER BY connection_count DESC
+    """,
+
+    # ── NEW: Archival metrics ──
+    'cold_tables': """
+        SELECT OBJECT_SCHEMA_NAME(i.object_id) AS schema_name, OBJECT_NAME(i.object_id) AS table_name,
+            MAX(ISNULL(s.last_user_seek,'1900-01-01')) AS last_seek,
+            MAX(ISNULL(s.last_user_scan,'1900-01-01')) AS last_scan,
+            MAX(ISNULL(s.last_user_lookup,'1900-01-01')) AS last_lookup,
+            DATEDIFF(day, MAX(ISNULL(CASE WHEN s.last_user_seek>s.last_user_scan THEN s.last_user_seek ELSE s.last_user_scan END,'1900-01-01')), GETUTCDATE()) AS days_since_last_read,
+            SUM(ps.reserved_page_count)*8/1024.0 AS size_mb
+        FROM sys.indexes i
+        LEFT JOIN sys.dm_db_index_usage_stats s ON i.object_id=s.object_id AND i.index_id=s.index_id AND s.database_id=DB_ID()
+        JOIN sys.dm_db_partition_stats ps ON i.object_id=ps.object_id AND i.index_id=ps.index_id
+        WHERE OBJECTPROPERTY(i.object_id,'IsUserTable')=1 AND i.index_id IN(0,1)
+        GROUP BY i.object_id
+        HAVING SUM(ps.reserved_page_count)*8/1024.0 > {archival_min_size_mb}
+        ORDER BY days_since_last_read DESC
+    """,
+    'partition_candidates': """
+        SELECT c.TABLE_SCHEMA AS schema_name, c.TABLE_NAME AS table_name,
+            c.COLUMN_NAME AS datetime_column, c.DATA_TYPE AS column_type,
+            ps.row_count, ps.size_mb
+        FROM INFORMATION_SCHEMA.COLUMNS c
+        JOIN (
+            SELECT OBJECT_SCHEMA_NAME(p.object_id) AS schema_name, OBJECT_NAME(p.object_id) AS table_name,
+                SUM(p.row_count) AS row_count, SUM(p.reserved_page_count)*8/1024.0 AS size_mb
+            FROM sys.dm_db_partition_stats p
+            JOIN sys.objects o ON p.object_id=o.object_id WHERE o.type='U'
+            GROUP BY p.object_id
+        ) ps ON c.TABLE_SCHEMA=ps.schema_name AND c.TABLE_NAME=ps.table_name
+        WHERE c.DATA_TYPE IN ('datetime','datetime2','date','smalldatetime','datetimeoffset')
+            AND c.TABLE_SCHEMA NOT IN ('sys','INFORMATION_SCHEMA')
+            AND ps.size_mb > {partition_candidate_min_gb} * 1024
+        ORDER BY ps.size_mb DESC
+    """,
+
+    # ── NEW: Operations metrics ──
+    'blocking_chains': """
+        SELECT r.session_id AS blocked_session_id, r.blocking_session_id,
+            r.wait_type, r.wait_time/1000 AS wait_time_seconds, r.command,
+            bs.login_name AS blocking_login, bs.host_name AS blocking_host,
+            bs.program_name AS blocking_program
+        FROM sys.dm_exec_requests r
+        LEFT JOIN sys.dm_exec_sessions bs ON r.blocking_session_id=bs.session_id
+        WHERE r.blocking_session_id > 0
+        ORDER BY r.wait_time DESC
+    """,
+    'tempdb_usage': """
+        SELECT s.session_id, s.login_name, s.host_name, s.program_name,
+            t.user_objects_alloc_page_count*8/1024.0 AS user_objects_mb,
+            t.internal_objects_alloc_page_count*8/1024.0 AS internal_objects_mb,
+            (t.user_objects_alloc_page_count+t.internal_objects_alloc_page_count)*8/1024.0 AS total_tempdb_mb
+        FROM sys.dm_db_session_space_usage t
+        JOIN sys.dm_exec_sessions s ON t.session_id=s.session_id
+        WHERE s.is_user_process=1 AND (t.user_objects_alloc_page_count+t.internal_objects_alloc_page_count)>0
+        ORDER BY total_tempdb_mb DESC
+    """,
+    'log_space': """
+        SELECT DB_NAME() AS database_name,
+            total_log_size_in_bytes/1048576.0 AS total_log_size_mb,
+            used_log_space_in_bytes/1048576.0 AS used_log_space_mb,
+            used_log_space_in_percent,
+            log_space_in_bytes_since_last_backup/1048576.0 AS log_since_backup_mb
+        FROM sys.dm_db_log_space_usage
+    """,
+    'stale_statistics': """
+        SELECT OBJECT_SCHEMA_NAME(s.object_id) AS schema_name,
+            OBJECT_NAME(s.object_id) AS table_name,
+            s.name AS stats_name, s.auto_created, s.user_created,
+            STATS_DATE(s.object_id, s.stats_id) AS last_updated,
+            DATEDIFF(day, STATS_DATE(s.object_id, s.stats_id), GETUTCDATE()) AS days_since_update,
+            sp.rows AS table_rows, sp.modification_counter
+        FROM sys.stats s
+        CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
+        WHERE OBJECTPROPERTY(s.object_id,'IsUserTable')=1
+            AND DATEDIFF(day, STATS_DATE(s.object_id, s.stats_id), GETUTCDATE()) > {stale_stats_days}
+            AND sp.rows > 1000
+        ORDER BY sp.modification_counter DESC
+    """,
+    'plan_cache': """
+        SELECT objtype AS plan_type, COUNT(*) AS plan_count,
+            SUM(size_in_bytes)/1048576.0 AS total_size_mb,
+            SUM(usecounts) AS total_use_count,
+            SUM(CASE WHEN usecounts=1 THEN 1 ELSE 0 END) AS single_use_count,
+            SUM(CASE WHEN usecounts=1 THEN size_in_bytes ELSE 0 END)/1048576.0 AS single_use_size_mb
+        FROM sys.dm_exec_cached_plans
+        GROUP BY objtype ORDER BY total_size_mb DESC
+    """,
+    'db_options': """
+        SELECT name AS database_name,
+            is_auto_create_stats_on, is_auto_update_stats_on,
+            is_read_committed_snapshot_on, snapshot_isolation_state_desc,
+            is_parameterization_forced
+        FROM sys.databases WHERE database_id=DB_ID()
+    """,
+    'query_store_status': """
+        SELECT actual_state_desc FROM sys.database_query_store_options
+    """,
+    'auto_tuning_recommendations': """
+        SELECT name AS recommendation_name, reason, type AS recommendation_type,
+            valid_since, state,
+            JSON_VALUE(details, '$.implementationDetails.script') AS implementation_script,
+            JSON_VALUE(score, '$.currentValue') AS current_score,
+            JSON_VALUE(score, '$.expectedImprovement') AS expected_improvement
+        FROM sys.dm_db_tuning_recommendations
+        WHERE state = 'Active'
+        ORDER BY JSON_VALUE(score, '$.expectedImprovement') DESC
+    """,
+    'long_running_transactions': """
+        SELECT at.transaction_id, at.name AS transaction_name,
+            at.transaction_begin_time,
+            DATEDIFF(second, at.transaction_begin_time, GETUTCDATE()) AS duration_seconds,
+            s.session_id, s.login_name, s.host_name, s.program_name,
+            dt.database_transaction_log_bytes_used/1048576.0 AS log_used_mb
+        FROM sys.dm_tran_active_transactions at
+        JOIN sys.dm_tran_session_transactions st ON at.transaction_id=st.transaction_id
+        JOIN sys.dm_exec_sessions s ON st.session_id=s.session_id
+        LEFT JOIN sys.dm_tran_database_transactions dt ON at.transaction_id=dt.transaction_id
+        WHERE at.transaction_type=1 AND DATEDIFF(second, at.transaction_begin_time, GETUTCDATE()) > {long_transaction_threshold_seconds}
+        ORDER BY duration_seconds DESC
+    """,
 }
 
 # List of all metric names (used by both notebooks)
@@ -531,4 +1077,5 @@ WAIT_CATEGORIES = {
     'ASYNC_NETWORK_IO': 'Network',
     'CXPACKET': 'Parallelism',
     'CXCONSUMER': 'Parallelism',
+    'LOG_RATE_GOVERNOR': 'LOG_RATE',
 }

@@ -1,6 +1,6 @@
 # 🚀 Azure SQL Server Recommendation Engine
 
-A comprehensive performance, storage, and cost optimization tool for Azure SQL Databases running entirely as **Databricks Notebooks**.
+A comprehensive performance, storage, code quality, and cost optimization tool for Azure SQL Databases running entirely as **Databricks Notebooks**.
 
 ## 🏗️ Architecture
 
@@ -13,7 +13,9 @@ A comprehensive performance, storage, and cost optimization tool for Azure SQL D
                             ▼
 ┌────────────────────────────────────────────────────────┐
 │  Notebook 1: 01_azure_sql_data_collector.ipynb         │
-│  • Incremental extraction via JDBC (watermarked)       │
+│  • 42 Metrics collected via JDBC pushdown              │
+│  • 2 Incremental queries (watermarked)                 │
+│  • 40 Snapshot queries (catalogs, DMVs, schemas)       │
 │  • Reads queries & thresholds from config.py           │
 │  • Writes partitioned Parquet to ADLS Gen2             │
 │  • Updates _metadata/watermarks.json                   │
@@ -30,8 +32,8 @@ A comprehensive performance, storage, and cost optimization tool for Azure SQL D
 ┌────────────────────────────────────────────────────────┐
 │  Notebook 2: 02_azure_sql_recommendation_engine.ipynb  │
 │  • Reads telemetry from ADLS Gen2 via PySpark          │
-│  • 4 Analyzers: Performance, Index, Storage, Cost      │
-│  • Priority scoring & Health Score (0–100)              │
+│  • 10 Analyzers (50+ sub-checks)                       │
+│  • Priority scoring & Health Score (0–100)             │
 │  • Parquet output: recommendations/... in ADLS Gen2    │
 │  • Interactive HTML executive report                   │
 └────────────────────────────────────────────────────────┘
@@ -43,112 +45,87 @@ A comprehensive performance, storage, and cost optimization tool for Azure SQL D
 azure_sql_advisor/
 ├── config.py                                          # Single configuration file (queries, thresholds, pricing, enums)
 ├── notebooks/
-│   ├── 01_azure_sql_data_collector.ipynb              # Databricks Notebook: Incremental Data Collection
-│   └── 02_azure_sql_recommendation_engine.ipynb       # Databricks Notebook: Recommendation Engine
+│   ├── 01_azure_sql_data_collector.ipynb              # Databricks Notebook 1: Data Collection (42 metrics)
+│   └── 02_azure_sql_recommendation_engine.ipynb       # Databricks Notebook 2: 10-Category Recommendation Engine
 ├── requirements.txt                                   # Python dependencies (reference)
+├── TECHNICAL_DESIGN_DOCUMENT.md                       # Comprehensive Technical Design Document (v3.0)
 └── README.md                                          # This file
 ```
 
-## ✨ Features
+## ✨ 10 Analysis Categories
 
-- 🏎️ **Performance Optimization**: Analyzes CPU/IO/Memory, wait statistics, and expensive queries
-- 🗂️ **Index Management**: Missing indexes, unused indexes, duplicates, and fragmentation
-- 💾 **Storage Analysis**: Large table audit, compression opportunities, NVARCHAR→VARCHAR savings
-- 💰 **Cost Optimization**: DTU/vCore rightsizing, serverless auto-pause, reserved capacity, Hybrid Benefit
-- 📈 **Incremental Ingestion**: Watermark-based extraction — only fetches new data since last run
-- 🔄 **Managed Service Safe**: Handles Azure SQL DMV rollover, failover resets, and catalog snapshots
+1. 🗂️ **Index Management** (`INDEXING`): Missing indexes, unused indexes, duplicates, fragmentation, foreign key coverage, columnstore candidates, write-heavy indexes.
+2. 📋 **Stored Procedures** (`STORED_PROCEDURES`): CPU/IO/duration/write hotspots, recompile spikes, parameter sniffing, and 7 anti-pattern static checks (`SET NOCOUNT ON`, `SELECT *`, `CURSOR`, dynamic `EXEC`, table variables, `OPTION(RECOMPILE)`, unhandled transactions).
+3. 👁️ **Views Optimization** (`VIEWS`): Deep view nesting, `SELECT *`, missing `WITH SCHEMABINDING`, high complexity, `NOLOCK` hints, indexed view candidates and maintenance overhead.
+4. 📐 **Schema Design** (`SCHEMA`): Heap tables, missing primary keys, wide tables (>30 cols), `NVARCHAR` overuse, LOB/MAX column audits.
+5. 💾 **Storage Analysis** (`STORAGE`): Large table audit, PAGE/ROW compression candidates, index-to-data space ratio, unused allocated space, database file growth.
+6. 📊 **Activity & Workload** (`ACTIVITY`): Top resource-consuming logins/programs, operation type breakdown (SELECT/INSERT/UPDATE/DELETE/EXEC/DDL), idle connection pooling.
+7. 🗄️ **Data Lifecycle & Archival** (`ARCHIVAL`): Cold table detection (>180/365/730 days idle), range partitioning candidates for time-series data.
+8. 🏎️ **Performance Diagnostics** (`PERFORMANCE`): CPU/IO/Memory/Worker/Session saturation, wait category breakdown, top CPU/Read queries, active blocking chains, TempDB usage, stale statistics, long-running transactions.
+9. 💰 **Cost & Capacity** (`COST`): Service tier rightsizing (scale down underutilized, scale up saturated), Serverless auto-pause opportunities, reserved capacity and Hybrid Benefit evaluation.
+10. ⚙️ **Database Operations** (`OPERATIONS`): Query Store state, auto-create/auto-update statistics flags, Read Committed Snapshot Isolation (`RCSI`), Azure automatic tuning recommendations, plan cache single-use bloat, transaction log space.
 
 ## 🚀 Getting Started
 
 ### Prerequisites
 
 - Azure Databricks workspace with access to Azure SQL Database
-- Azure Storage Account (ADLS Gen2) mounted or accessible via ABFSS
+- Azure Storage Account (ADLS Gen2) accessible via ABFSS connector
 - JDBC connectivity to Azure SQL Database from Databricks cluster
 
 ### Step 1: Upload Files to Databricks
 
-1. Upload `config.py` to your Databricks Repos or workspace files
-2. Import both notebooks from `notebooks/` into your workspace
+1. Clone or upload repo to Databricks Repos (`Workspace > Repos`)
+2. `config.py` acts as the single source of truth
 
 ### Step 2: Run Data Collection (Notebook 1)
 
-Open **01_azure_sql_data_collector.ipynb** and configure the widgets:
+Open **`notebooks/01_azure_sql_data_collector.ipynb`** and set widget parameters:
 
 | Widget | Description | Example |
-|--------|-------------|---------|
+|---|---|---|
 | `server_name` | Azure SQL Server FQDN | `myserver.database.windows.net` |
 | `database_name` | Database name | `mydb` |
-| `storage_account` | ADLS Gen2 storage account | `mystorageaccount` |
-| `storage_container` | Blob container name | `azure-sql-telemetry` |
-| `auth_method` | Authentication method | `managed_identity` / `sql` |
-
-Run all cells to extract telemetry and persist to storage.
+| `secret_scope` | Databricks Secret Scope | `azure-sql-credentials` |
+| `username_key` | Secret key for username | `sql-username` |
+| `password_key` | Secret key for password | `sql-password` |
+| `storage_account` | ADLS Gen2 account name | `mystorageaccount` |
+| `storage_container` | Container name | `azure-sql-telemetry` |
 
 ### Step 3: Run Recommendation Engine (Notebook 2)
 
-Open **02_azure_sql_recommendation_engine.ipynb** and configure:
+Open **`notebooks/02_azure_sql_recommendation_engine.ipynb`** and configure:
 
 | Widget | Description | Example |
-|--------|-------------|---------|
-| `server_name` | Same server name | `myserver.database.windows.net` |
-| `database_name` | Same database | `mydb` |
-| `storage_account` | Same storage account | `mystorageaccount` |
-| `storage_container` | Same container | `azure-sql-telemetry` |
-| `lookback_days` | Days of history to analyze | `7` |
+|---|---|---|
+| `server_name` | Azure SQL Server FQDN | `myserver.database.windows.net` |
+| `database_name` | Database name | `mydb` |
+| `storage_account` | ADLS Gen2 account name | `mystorageaccount` |
+| `storage_container` | Container name | `azure-sql-telemetry` |
+| `lookback_days` | Lookback window in days | `7` |
 
-Run all cells to generate prioritized recommendations, interactive charts, Parquet storage output, and HTML report.
+### Step 4: Schedule via Databricks Workflows
 
-### Step 4: Schedule (Optional)
+- **Task 1 (Collector)**: Run every 15–60 minutes
+- **Task 2 (Engine)**: Run daily after Task 1 completes
 
-Create a Databricks Workflow with two tasks:
-1. **Task 1**: Run `01_azure_sql_data_collector` (e.g., every 15 minutes)
-2. **Task 2**: Run `02_azure_sql_recommendation_engine` (e.g., daily), depends on Task 1
-
-## 📊 Storage Layout
-
-Telemetry is stored in date-partitioned Parquet:
+## 📊 Storage Layout (ADLS Gen2)
 
 ```
-raw/{server}/{database}/
-├── resource_stats/year=2025/month=08/day=19/...parquet    # Incremental
-├── query_store_stats/year=2025/month=08/day=19/...parquet # Incremental
-├── wait_stats/year=2025/month=08/day=19/...parquet        # Snapshot
-├── missing_indexes/year=2025/month=08/day=19/...parquet   # Snapshot
-├── table_sizes/year=2025/month=08/day=19/...parquet       # Snapshot
-├── ...
-└── _metadata/watermarks.json                              # Watermark tracking
+azure-sql-telemetry/
+├── raw/{server}/{database}/
+│   ├── resource_stats/year=YYYY/month=MM/day=DD/*.parquet
+│   ├── query_store_stats/year=YYYY/month=MM/day=DD/*.parquet
+│   ├── sp_execution_stats/year=YYYY/.../*.parquet
+│   ├── views_analysis/year=YYYY/.../*.parquet
+│   ├── cold_tables/year=YYYY/.../*.parquet
+│   ├── ... (42 metric directories)
+│   └── _metadata/watermarks.json
+└── recommendations/{server}/{database}/
+    ├── year=YYYY/month=MM/day=DD/*.parquet
+    └── reports/{database}_report_YYYYMMDD_HHMMSS.html
 ```
 
-## 🔧 Configuration
+## 🔧 Technical Details & Formulas
 
-All configuration lives in `config.py`:
-
-- **`AdvisorConfig`**: Central dataclass with all connection, storage, threshold, and weight settings
-- **`INCREMENTAL_QUERIES`**: Time-series DMV queries with watermark column definitions
-- **`SNAPSHOT_QUERIES`**: Full-snapshot catalog/counter queries (parameterized)
-- **`AZURE_SQL_PRICING`**: Complete DTU and vCore pricing matrix
-- **`SEVERITY_SCORES`**: Priority scoring weights
-- **`WAIT_CATEGORIES`**: Wait type → bottleneck category mapping
-- **Enums**: `Category`, `Severity`, `Effort`, `Risk`, `Confidence`
-- **`Recommendation`**: Dataclass for recommendation output
-
-## 📋 Metrics Collected
-
-| Metric | Type | DMV Source |
-|--------|------|-----------|
-| `resource_stats` | Incremental | `sys.dm_db_resource_stats` |
-| `query_store_stats` | Incremental | `sys.query_store_runtime_stats` |
-| `database_summary` | Snapshot | `sys.tables`, `sys.indexes` |
-| `top_queries_cpu` | Snapshot | `sys.dm_exec_query_stats` |
-| `top_queries_reads` | Snapshot | `sys.dm_exec_query_stats` |
-| `wait_stats` | Snapshot | `sys.dm_os_wait_stats` |
-| `missing_indexes` | Snapshot | `sys.dm_db_missing_index_*` |
-| `unused_indexes` | Snapshot | `sys.indexes` + `sys.dm_db_index_usage_stats` |
-| `duplicate_indexes` | Snapshot | `sys.indexes` + `sys.index_columns` |
-| `index_fragmentation` | Snapshot | `sys.dm_db_index_physical_stats` |
-| `table_sizes` | Snapshot | `sys.dm_db_partition_stats` |
-| `database_files` | Snapshot | `sys.database_files` |
-| `compression_candidates` | Snapshot | `sys.partitions` |
-| `service_tier` | Snapshot | `DATABASEPROPERTYEX()` |
-| `data_type_audit` | Snapshot | `INFORMATION_SCHEMA.COLUMNS` |
+For deep architecture diagrams, DMV query catalogs, priority score weights, and full threshold listings, consult the [Technical Design Document](TECHNICAL_DESIGN_DOCUMENT.md).

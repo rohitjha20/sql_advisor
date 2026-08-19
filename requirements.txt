@@ -1,0 +1,18 @@
+# Azure SQL Advisor — Dependencies
+# These are pre-installed in Azure Databricks Runtime.
+# Listed here for reference and local development.
+
+# PySpark (provided by Databricks Runtime)
+# pyspark>=3.4.0
+
+# Azure Storage (provided by Databricks Runtime with ABFSS connector)
+# azure-storage-blob>=12.0.0
+# azure-identity>=1.0.0
+
+# Data processing
+pandas>=1.5.0
+pyarrow>=10.0.0
+
+# JDBC driver (Databricks Runtime includes mssql-jdbc)
+# For local testing with pyodbc:
+# pyodbc>=4.0.35

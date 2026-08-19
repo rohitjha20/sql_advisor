@@ -1,10 +1,10 @@
 # Azure SQL Server Recommendation Engine — Technical Design Document
 
-**Version**: 2.0  
+**Version**: 2.1  
 **Date**: August 19, 2026  
 **Author**: Architecture Team  
 **Audience**: Development, Data Engineering, and Platform Teams  
-**Status**: Approved for Implementation  
+**Status**: Approved for Implementation (Pure Parquet / ADLS Gen2 Storage Architecture)
 
 ---
 
@@ -39,10 +39,10 @@ Without proactive extraction and long-term persistence:
 
 ### Solution
 
-A **decoupled, two-stage Databricks architecture**:
+A **decoupled, two-stage Databricks architecture persisting directly to Azure Storage Account (ADLS Gen2) in Parquet format**:
 
 1. **Stage 1 — Data Collector (`01_azure_sql_data_collector.ipynb`)**: Incrementally extracts telemetry from Azure SQL Database DMVs and persists it as date-partitioned Parquet files in Azure Data Lake Storage Gen2 (ADLS Gen2) using watermark-based queries.
-2. **Stage 2 — Recommendation Engine (`02_azure_sql_recommendation_engine.ipynb`)**: Reads multi-day historical telemetry from ADLS Gen2 via PySpark, executes 4 specialized analyzers (Performance, Index, Storage, Cost), scores/ranks findings, and writes them to a Delta Lake table and an interactive HTML report.
+2. **Stage 2 — Recommendation Engine (`02_azure_sql_recommendation_engine.ipynb`)**: Reads multi-day historical telemetry from ADLS Gen2 via PySpark, executes 4 specialized analyzers (Performance, Index, Storage, Cost), scores/ranks findings, and writes them to ADLS Gen2 as partitioned Parquet files and an interactive HTML report.
 
 ### Core Architectural Guarantees
 
@@ -51,6 +51,7 @@ A **decoupled, two-stage Databricks architecture**:
 | **Single Source of Truth** | All queries, pricing tiers, and thresholds live exclusively in [`config.py`](config.py). |
 | **No Module Bloat** | Only 1 `.py` file (`config.py`) in the codebase; execution logic is contained in Databricks `.ipynb` notebooks. |
 | **Zero Data Loss** | High-watermark tracking (`_metadata/watermarks.json`) ensures incremental time-series extraction without duplicates or omissions. |
+| **Pure Storage / No Table Lock-In** | Both raw telemetry and recommendations are stored as open standard Parquet files in ADLS Gen2. |
 | **PaaS Isolation** | Decoupling extraction from analytical scoring prevents resource overhead on the live Azure SQL production database. |
 | **Zero Secrets Stored** | Azure AD Managed Identity (MSI) provides passwordless authentication to both Azure SQL and ADLS Gen2. |
 
@@ -73,15 +74,12 @@ graph TD
             CFG["config.py<br/>(Single Config Module)"]
         end
 
-        subgraph Azure Data Lake Storage Gen2
+        subgraph Azure Data Lake Storage Gen2 (ADLS Gen2)
             ADLS["ADLS Gen2 Container<br/>(azure-sql-telemetry)"]
             RAW["raw/{server}/{database}/{metric}/year=.../"]
             WM["_metadata/watermarks.json"]
+            RECS["recommendations/{server}/{database}/year=.../"]
             REP["reports/{server}/{database}/*.html"]
-        end
-
-        subgraph Delta Lake & Analytics
-            DELTA["Delta Table<br/>azure_sql_recommendations"]
         end
     end
 
@@ -91,7 +89,7 @@ graph TD
     WM <-->|"Read / Update Watermark"| NB1
     NB1 -->|"Write Partitioned Parquet"| RAW
     RAW -->|"PySpark Read (Lookback Window)"| NB2
-    NB2 -->|"Append Findings"| DELTA
+    NB2 -->|"Write Partitioned Parquet"| RECS
     NB2 -->|"Export HTML Report"| REP
 
     style SQL fill:#0078D4,color:#fff
@@ -101,7 +99,7 @@ graph TD
     style ADLS fill:#107C41,color:#fff
     style RAW fill:#107C41,color:#fff
     style WM fill:#D83B01,color:#fff
-    style DELTA fill:#008AD7,color:#fff
+    style RECS fill:#008AD7,color:#fff
     style REP fill:#7FBA00,color:#fff
 ```
 
@@ -147,7 +145,7 @@ azure_sql_advisor/
 ### 3.2 Notebook 1: Incremental Data Collector
 
 **Location**: `notebooks/01_azure_sql_data_collector.ipynb`  
-**Execution Context**: Databricks Job Cluster or Interactive Cluster (Single Node or Multi Node)
+**Execution Context**: Databricks Job Cluster or Interactive Cluster
 
 | Stage | Process Description |
 |-------|---------------------|
@@ -168,14 +166,14 @@ azure_sql_advisor/
 
 | Stage | Process Description |
 |-------|---------------------|
-| **1. Widgets** | Captures `server_name`, `database_name`, `storage_account`, `storage_container`, `lookback_days`, `delta_table_name`. |
+| **1. Widgets** | Captures `server_name`, `database_name`, `storage_account`, `storage_container`, `lookback_days`. |
 | **2. Storage Ingestion** | Reads partitioned Parquet datasets from ADLS Gen2 across the target lookback window (e.g. past 7 days) via PySpark. |
 | **3. Performance Analyzer** | Evaluates CPU/IO saturation, dominant wait states, slow queries, and Query Store regressions. |
 | **4. Index Analyzer** | Identifies missing indexes (with generated `CREATE INDEX` DDL), unused indexes (with `DROP INDEX` DDL), duplicates, and fragmented indexes (with `REBUILD`/`REORGANIZE` DDL). |
 | **5. Storage Analyzer** | Audits large tables (> 10GB), unused allocated space, PAGE vs. ROW compression savings, and NVARCHAR-to-VARCHAR migration opportunities. |
 | **6. Cost Analyzer** | Identifies underutilized databases for downgrade rightsizing, computes serverless auto-pause opportunities, reserved capacity savings, and Azure Hybrid Benefit eligibility. |
 | **7. Scoring & Health Index** | Computes prioritized weighted scores (0–100) and overall database Health Score. |
-| **8. Delta Table Storage** | Appends structured recommendation records to the Delta Lake table `azure_sql_recommendations`. |
+| **8. Parquet Output** | Appends structured recommendation records as partitioned Parquet files to `recommendations/{server}/{database}/year=YYYY/month=MM/day=DD/`. |
 | **9. HTML Report Export** | Renders a self-contained, responsive HTML executive report and writes it to ADLS Gen2 / DBFS. |
 
 ---
@@ -192,7 +190,6 @@ sequenceDiagram
     participant SQL as Azure SQL DB
     participant ADLS as ADLS Gen2 Storage
     participant NB2 as 02_recommendation_engine
-    participant Delta as Delta Lake Table
 
     Note over Sched,SQL: Stage 1: Recurring Telemetry Ingestion (e.g., Every 15 min)
     Sched->>NB1: Trigger Data Collector Run
@@ -210,7 +207,7 @@ sequenceDiagram
     NB1->>ADLS: Commit updated _metadata/watermarks.json
     NB1-->>Sched: Exit Success (Records Extracted)
 
-    Note over Sched,Delta: Stage 2: Daily Analytics & Recommendation Execution
+    Note over Sched,NB2: Stage 2: Daily Analytics & Recommendation Execution
     Sched->>NB2: Trigger Recommendation Engine (Daily 06:00 UTC)
     NB2->>ADLS: PySpark Read: raw/{server}/{db}/* (Lookback = 7 Days)
     ADLS-->>NB2: Historical Telemetry DataFrames
@@ -218,7 +215,7 @@ sequenceDiagram
     NB2->>NB2: Run Performance, Index, Storage, Cost Analyzers
     NB2->>NB2: Calculate Priority Scores & Health Score (0-100)
 
-    NB2->>Delta: Append Recommendations to azure_sql_recommendations
+    NB2->>ADLS: Write Parquet -> recommendations/{server}/{db}/year=.../month=.../day=.../
     NB2->>ADLS: Write Standalone HTML Report to reports/{server}/{db}/*.html
     NB2-->>Sched: Exit Success (Health Score, Total Recommendations)
 ```
@@ -257,13 +254,18 @@ abfss://{storage_container}@{storage_account}.dfs.core.windows.net/
 │           ├── database_summary/                          # Daily Snapshot
 │           ├── top_queries_cpu/                           # Daily Snapshot
 │           └── top_queries_reads/                         # Daily Snapshot
+├── recommendations/
+│   └── {server_fqdn}/
+│       └── {database_name}/
+│           └── year=YYYY/month=MM/day=DD/
+│               └── *.parquet                              # Partitioned Recommendations
 └── reports/
     └── {server_fqdn}/
         └── {database_name}/
             └── azure_sql_advisor_report_YYYYMMDD_HHMMSS.html
 ```
 
-### 5.2 Delta Lake Target Schema (`azure_sql_recommendations`)
+### 5.2 Recommendations Parquet Schema
 
 | Column Name | Data Type | Description |
 |-------------|-----------|-------------|
@@ -469,7 +471,7 @@ GRANT VIEW DATABASE PERFORMANCE STATE TO [databricks-cluster-identity]; -- Azure
 4. Click **Run All**.
 5. Verify output:
    - Visual charts (CPU/IO trends, severity bar charts, top-10 table) rendered inline.
-   - Rows inserted into Delta table `azure_sql_recommendations`.
+   - Parquet files written to `abfss://azure-sql-telemetry@centraltelemetry.dfs.core.windows.net/recommendations/...`.
    - Standalone HTML report generated and saved to ADLS Gen2.
 
 ---
@@ -511,8 +513,7 @@ GRANT VIEW DATABASE PERFORMANCE STATE TO [databricks-cluster-identity]; -- Azure
           "database_name": "orders_db",
           "storage_account": "centraltelemetry",
           "storage_container": "azure-sql-telemetry",
-          "lookback_days": "7",
-          "delta_table_name": "azure_sql_recommendations"
+          "lookback_days": "7"
         }
       },
       "job_cluster_key": "advisor_job_cluster",
@@ -525,10 +526,7 @@ GRANT VIEW DATABASE PERFORMANCE STATE TO [databricks-cluster-identity]; -- Azure
       "new_cluster": {
         "spark_version": "14.3.x-scala2.12",
         "node_type_id": "Standard_DS3_v2",
-        "num_workers": 1,
-        "spark_conf": {
-          "spark.databricks.delta.preview.enabled": "true"
-        }
+        "num_workers": 1
       }
     }
   ],
@@ -548,10 +546,10 @@ GRANT VIEW DATABASE PERFORMANCE STATE TO [databricks-cluster-identity]; -- Azure
 | Test Case | Scope | Execution Command / Action | Acceptance Criteria |
 |-----------|-------|----------------------------|---------------------|
 | **TC-01** | Config Syntax | `python3 -c "import config"` | Zero import errors, all enums and queries accessible. |
-| **TC-02** | Notebook 1 Validation | Run Notebook 1 against Azure SQL | All 15 metrics produce records; Parquet files written. |
+| **TC-02** | Notebook 1 Validation | Run Notebook 1 against Azure SQL | All 15 metrics produce records; Parquet files written to `raw/...`. |
 | **TC-03** | Incremental Watermark | Run Notebook 1 twice consecutively | Second execution only extracts rows with timestamp > run 1. |
 | **TC-04** | Telemetry Loading | Run Cell 4 of Notebook 2 | PySpark DataFrame counts match Parquet record totals. |
-| **TC-05** | Delta Output | Query Delta Lake table | `SELECT COUNT(*) FROM azure_sql_recommendations` > 0. |
+| **TC-05** | Parquet Output | Browse ADLS Gen2 `recommendations/...` | Parquet files exist for the execution date partition. |
 | **TC-06** | HTML Report | Download and open HTML in browser | Report renders responsive styling, charts, and DDL code blocks. |
 
 ---
@@ -587,7 +585,7 @@ GRANT VIEW DATABASE PERFORMANCE STATE TO [databricks-cluster-identity]; -- Azure
 | `storage_base_path` | `str` | `"raw"` | Base prefix for raw Parquet telemetry |
 | `use_managed_identity` | `bool` | `True` | Whether to use AAD Managed Identity for storage |
 | `watermark_blob_name` | `str` | `"_metadata/watermarks.json"` | Watermark JSON metadata blob path |
-| `storage_format` | `str` | `"parquet"` | Format for raw telemetry (`parquet` or `delta`) |
+| `storage_format` | `str` | `"parquet"` | Format for raw telemetry (`parquet` or `json`) |
 | `lookback_days` | `int` | `7` | Days of history analyzed by recommendation engine |
 | `top_queries_count`| `int` | `50` | Number of top CPU/IO queries extracted |
 | `min_execution_count` | `int` | `10` | Minimum execution threshold for query stats |
@@ -606,7 +604,7 @@ GRANT VIEW DATABASE PERFORMANCE STATE TO [databricks-cluster-identity]; -- Azure
 | `weight_performance` | `float` | `0.40` | Priority weighting for Performance findings |
 | `weight_storage` | `float` | `0.30` | Priority weighting for Storage findings |
 | `weight_cost` | `float` | `0.30` | Priority weighting for Cost findings |
-| `delta_table_name`| `str` | `"azure_sql_recommendations"` | Output Delta Lake table name |
+| `recommendations_base_path`| `str` | `"recommendations"` | Output Parquet partition folder path |
 
 ---
 *End of Technical Design Document — Azure SQL Advisor Platform*

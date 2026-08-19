@@ -95,7 +95,7 @@ class AdvisorConfig:
     storage_base_path: str = "raw"
     use_managed_identity: bool = True
     watermark_blob_name: str = "_metadata/watermarks.json"
-    storage_format: str = "parquet"      # 'parquet', 'delta', or 'json'
+    storage_format: str = "parquet"      # 'parquet' or 'json'
 
     # ── Analysis Settings ──
     lookback_days: int = 7
@@ -139,7 +139,7 @@ class AdvisorConfig:
     # ── Output ──
     output_dir: str = "./reports"
     report_filename: str = "azure_sql_advisor_report.html"
-    delta_table_name: str = "azure_sql_recommendations"
+    recommendations_base_path: str = "recommendations"
 
     def __post_init__(self):
         total_weight = self.weight_performance + self.weight_storage + self.weight_cost

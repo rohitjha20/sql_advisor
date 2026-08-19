@@ -32,7 +32,7 @@ A comprehensive performance, storage, and cost optimization tool for Azure SQL D
 │  • Reads telemetry from ADLS Gen2 via PySpark          │
 │  • 4 Analyzers: Performance, Index, Storage, Cost      │
 │  • Priority scoring & Health Score (0–100)              │
-│  • Delta Lake output: azure_sql_recommendations        │
+│  • Parquet output: recommendations/... in ADLS Gen2    │
 │  • Interactive HTML executive report                   │
 └────────────────────────────────────────────────────────┘
 ```
@@ -96,9 +96,8 @@ Open **02_azure_sql_recommendation_engine.ipynb** and configure:
 | `storage_account` | Same storage account | `mystorageaccount` |
 | `storage_container` | Same container | `azure-sql-telemetry` |
 | `lookback_days` | Days of history to analyze | `7` |
-| `delta_table_name` | Delta table for results | `azure_sql_recommendations` |
 
-Run all cells to generate prioritized recommendations, interactive charts, Delta output, and HTML report.
+Run all cells to generate prioritized recommendations, interactive charts, Parquet storage output, and HTML report.
 
 ### Step 4: Schedule (Optional)
 
